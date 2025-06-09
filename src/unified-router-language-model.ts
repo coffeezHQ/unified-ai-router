@@ -1,184 +1,158 @@
-import { LanguageModelV1, LanguageModelV1CallOptions, LanguageModelV1StreamPart, LanguageModelV1ImagePart, LanguageModelV1FinishReason, LanguageModelV1ProviderMetadata, LanguageModelV1ObjectGenerationMode } from '@ai-sdk/provider';
-import { z } from 'zod';
+import { LanguageModelV1, LanguageModelV1CallOptions, LanguageModelV1StreamPart, LanguageModelV1FinishReason, LanguageModelV1ProviderMetadata } from '@ai-sdk/provider';
 
-const UnifiedRouterResponseSchema = z.object({
-  id: z.string(),
-  model: z.string(),
-  choices: z.array(z.object({
-    index: z.number(),
-    message: z.object({
-      role: z.string(),
-      content: z.string(),
-    }),
-    finish_reason: z.string().nullable(),
-  })),
-  usage: z.object({
-    prompt_tokens: z.number(),
-    completion_tokens: z.number(),
-    total_tokens: z.number(),
-    cost: z.number().optional(),
-  }).optional(),
-  provider_metadata: z.record(z.unknown()).optional(),
-});
+interface UnifiedRouterResponse {
+  id: string;
+  model: string;
+  created: number;
+  object: string;
+  choices: Array<{
+    index: number;
+    message: {
+      role: string;
+      content: string;
+    };
+    finish_reason: string;
+  }>;
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  provider_metadata?: Record<string, unknown>;
+}
 
-const UnifiedRouterImageGenerationResponseSchema = z.object({
-  id: z.string(),
-  model: z.string(),
-  data: z.array(z.object({
-    url: z.string().optional(),
-    b64_json: z.string().optional(),
-    revised_prompt: z.string().optional(),
-  })),
-  usage: z.object({
-    prompt_tokens: z.number(),
-    completion_tokens: z.number(),
-    total_tokens: z.number(),
-    cost: z.number().optional(),
-  }).optional(),
-  provider_metadata: z.record(z.unknown()).optional(),
-});
+interface UnifiedRouterError {
+  error: {
+    message: string;
+    type: string;
+    code: string;
+  };
+}
 
 export class UnifiedRouterLanguageModel implements LanguageModelV1 {
-  readonly specificationVersion = 'v1';
-  readonly modelId: string;
-  readonly defaultObjectGenerationMode: LanguageModelV1ObjectGenerationMode = 'tool';
-  readonly provider: string;
+  public readonly specificationVersion = 'v1';
+  public readonly modelId: string;
+  public readonly defaultObjectGenerationMode = 'tool';
+  public provider: string;
+  private model: string;
+  private apiKey: string;
+  private baseURL: string;
 
-  private readonly apiKey: string;
-  private readonly baseURL: string;
-  private readonly extraBody: Record<string, unknown>;
-
-  constructor({
-    model,
-    apiKey,
-    baseURL = 'https://api.unifiedrouter.ai/v1',
-    extraBody = {},
-    provider = 'unified-ai-router',
-  }: {
+  constructor(config: {
+    provider: string;
     model: string;
     apiKey: string;
     baseURL?: string;
-    extraBody?: Record<string, unknown>;
-    provider?: string;
   }) {
-    this.modelId = model;
-    this.apiKey = apiKey;
-    this.baseURL = baseURL;
-    this.extraBody = extraBody;
-    this.provider = provider;
+    this.provider = config.provider;
+    this.model = config.model;
+    this.modelId = config.model;
+    this.apiKey = config.apiKey;
+    this.baseURL = config.baseURL || 'https://api.unified-ai-router.com/v1';
   }
 
   async doGenerate(
-    options: LanguageModelV1CallOptions,
-  ) {
-    const { prompt, mode } = options;
-
-    // Handle image generation
-    if (mode?.type === 'object-json') {
-      const response = await fetch(`${this.baseURL}/images/generations`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.modelId,
-          prompt: prompt,
-          n: 1,
-          size: '1024x1024',
-          ...this.extraBody,
-        }),
-      });
-
-      if (!response.ok) {
-        const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(`Image generation failed: ${error.error || response.statusText}`);
-      }
-
-      const data = await response.json();
-      const validatedData = UnifiedRouterImageGenerationResponseSchema.parse(data);
-
-      // Convert base64 to Uint8Array if available
-      const imageData = validatedData.data[0].b64_json
-        ? Buffer.from(validatedData.data[0].b64_json, 'base64')
-        : null;
-
-      return {
-        text: '',
-        finishReason: 'stop' as LanguageModelV1FinishReason,
-        usage: {
-          promptTokens: validatedData.usage?.prompt_tokens ?? 0,
-          completionTokens: validatedData.usage?.completion_tokens ?? 0,
-        },
-        rawCall: { rawPrompt: prompt, rawSettings: { model: this.modelId, ...this.extraBody } },
-        rawResponse: { headers: Object.fromEntries(response.headers.entries()) },
-        warnings: [],
-        files: imageData ? [{
-          data: imageData,
-          mimeType: 'image/png',
-        }] : undefined,
-        providerMetadata: validatedData.provider_metadata as LanguageModelV1ProviderMetadata,
-      };
-    }
-
-    // Handle text generation
+    options: LanguageModelV1CallOptions
+  ): Promise<{
+    text?: string;
+    finishReason: LanguageModelV1FinishReason;
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+    rawCall: {
+      rawPrompt: unknown;
+      rawSettings: Record<string, unknown>;
+    };
+    rawResponse?: {
+      headers: Record<string, string>;
+    };
+    warnings?: Array<{
+      type: 'other';
+      message: string;
+    }>;
+    providerMetadata?: LanguageModelV1ProviderMetadata;
+  }> {
     const response = await fetch(`${this.baseURL}/chat/completions`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({
-        model: this.modelId,
-        messages: [{ role: 'user', content: prompt }],
-        ...this.extraBody,
+        model: this.model,
+        messages: [{ role: 'user', content: options.prompt }],
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
+        stream: false,
       }),
     });
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-      throw new Error(`Text generation failed: ${error.error || response.statusText}`);
+    const data = await response.json() as UnifiedRouterResponse | UnifiedRouterError;
+
+    if ('error' in data) {
+      throw new Error(`Unified Router API error: ${data.error.message}`);
     }
 
-    const data = await response.json();
-    const validatedData = UnifiedRouterResponseSchema.parse(data);
-
+    const choice = data.choices[0];
     return {
-      text: validatedData.choices[0].message.content,
-      finishReason: (validatedData.choices[0].finish_reason ?? 'stop') as LanguageModelV1FinishReason,
+      text: choice.message.content,
+      finishReason: choice.finish_reason as LanguageModelV1FinishReason,
       usage: {
-        promptTokens: validatedData.usage?.prompt_tokens ?? 0,
-        completionTokens: validatedData.usage?.completion_tokens ?? 0,
+        promptTokens: data.usage.prompt_tokens,
+        completionTokens: data.usage.completion_tokens,
+        totalTokens: data.usage.total_tokens,
       },
-      rawCall: { rawPrompt: prompt, rawSettings: { model: this.modelId, ...this.extraBody } },
-      rawResponse: { headers: Object.fromEntries(response.headers.entries()) },
+      rawCall: {
+        rawPrompt: options.prompt,
+        rawSettings: { model: this.model },
+      },
+      rawResponse: {
+        headers: Object.fromEntries(response.headers.entries()),
+      },
       warnings: [],
-      providerMetadata: validatedData.provider_metadata as LanguageModelV1ProviderMetadata,
+      providerMetadata: data.provider_metadata as LanguageModelV1ProviderMetadata,
     };
   }
 
   async doStream(
-    options: LanguageModelV1CallOptions,
-  ) {
-    const { prompt } = options;
-
+    options: LanguageModelV1CallOptions
+  ): Promise<{
+    stream: ReadableStream<LanguageModelV1StreamPart>;
+    rawCall: {
+      rawPrompt: unknown;
+      rawSettings: Record<string, unknown>;
+    };
+    rawResponse?: {
+      headers: Record<string, string>;
+    };
+    request?: {
+      body: string;
+    };
+    warnings?: Array<{
+      type: 'other';
+      message: string;
+    }>;
+  }> {
     const response = await fetch(`${this.baseURL}/chat/completions`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({
-        model: this.modelId,
-        messages: [{ role: 'user', content: prompt }],
+        model: this.model,
+        messages: [{ role: 'user', content: options.prompt }],
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
         stream: true,
-        ...this.extraBody,
       }),
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-      throw new Error(`Streaming failed: ${error.error || response.statusText}`);
+      const errorData = await response.json() as UnifiedRouterError;
+      throw new Error(`Unified Router API error: ${errorData.error.message}`);
     }
 
     if (!response.body) {
@@ -188,8 +162,8 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
-    const stream = new ReadableStream({
-      async pull(controller) {
+    const stream = new ReadableStream<LanguageModelV1StreamPart>({
+      async pull(controller): Promise<void> {
         const { done, value } = await reader.read();
 
         if (done) {
@@ -209,9 +183,8 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
             }
 
             try {
-              const parsed = JSON.parse(data);
-              const validatedData = UnifiedRouterResponseSchema.parse(parsed);
-              const content = validatedData.choices[0].message.content;
+              const parsed = JSON.parse(data) as UnifiedRouterResponse;
+              const content = parsed.choices[0].message.content;
 
               if (content) {
                 controller.enqueue({ type: 'text-delta', textDelta: content });
@@ -226,9 +199,22 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
 
     return {
       stream,
-      rawCall: { rawPrompt: prompt, rawSettings: { model: this.modelId, ...this.extraBody } },
-      rawResponse: { headers: Object.fromEntries(response.headers.entries()) },
-      request: { body: JSON.stringify({ model: this.modelId, messages: [{ role: 'user', content: prompt }], stream: true, ...this.extraBody }) },
+      rawCall: {
+        rawPrompt: options.prompt,
+        rawSettings: { model: this.model },
+      },
+      rawResponse: {
+        headers: Object.fromEntries(response.headers.entries()),
+      },
+      request: {
+        body: JSON.stringify({
+          model: this.model,
+          messages: [{ role: 'user', content: options.prompt }],
+          temperature: options.temperature,
+          max_tokens: options.maxTokens,
+          stream: true,
+        }),
+      },
       warnings: [],
     };
   }

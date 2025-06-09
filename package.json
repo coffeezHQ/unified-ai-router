@@ -13,6 +13,7 @@
     "test:watch": "jest --watch",
     "test:ci": "jest --ci --coverage --runInBand",
     "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
     "docs": "typedoc src",
     "prepare": "npm run build"
   },

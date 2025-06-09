@@ -3,19 +3,24 @@ import { UnifiedRouterLanguageModel } from './unified-router-language-model';
 
 export interface UnifiedRouterProviderConfig {
   apiKey: string;
+  model?: string;
   baseURL?: string;
-  extraBody?: Record<string, unknown>;
 }
 
-export function createUnifiedRouter(config: UnifiedRouterProviderConfig) {
-  return (model: string, modelOptions?: { extraBody?: Record<string, unknown> }) => {
-    return new UnifiedRouterLanguageModel({
-      model,
-      apiKey: config.apiKey,
-      baseURL: config.baseURL,
-      extraBody: { ...config.extraBody, ...modelOptions?.extraBody },
-      provider: 'unified-ai-router',
-    });
+export function createUnifiedRouter(config: UnifiedRouterProviderConfig): {
+  provider: string;
+  createModel: (modelId: string) => LanguageModelV1;
+} {
+  return {
+    provider: 'unified-ai-router',
+    createModel: (modelId: string): LanguageModelV1 => {
+      return new UnifiedRouterLanguageModel({
+        provider: 'unified-ai-router',
+        model: modelId,
+        apiKey: config.apiKey,
+        baseURL: config.baseURL,
+      });
+    },
   };
 }
 
