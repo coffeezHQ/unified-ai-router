@@ -1,428 +1,347 @@
-import type { 
-  LanguageModelV1, 
-  LanguageModelV1FinishReason, 
-  LanguageModelV1CallOptions, 
-  LanguageModelV1StreamPart, 
-  LanguageModelV1ProviderMetadata,
-  LanguageModelV1FunctionToolCall,
-  LanguageModelV1LogProbs,
-  LanguageModelV1ImagePart
-} from '@ai-sdk/provider';
-import { createJsonResponseHandler, postJsonToApi, createJsonErrorResponseHandler, createEventSourceResponseHandler } from '@ai-sdk/provider-utils';
-import { UnifiedRouterChatCompletionResponseSchema } from './schemas/unified-router-chat-completion';
-import { z } from 'zod';
-import type {
-  UnifiedRouterModelId,
-  UnifiedRouterSettings,
-  UnifiedRouterProviderConfig,
-} from './types/unified-router-provider';
+import { LanguageModelV1, LanguageModelV1CallOptions, LanguageModelV1StreamPart, LanguageModelV1FinishReason, LanguageModelV1ProviderMetadata, LanguageModelV1TextPart, LanguageModelV1Message } from '@ai-sdk/provider';
 
-const UnifiedRouterErrorSchema = z.object({ 
-  error: z.string().optional(),
-  code: z.string().optional(),
-  type: z.string().optional(),
-  message: z.string().optional()
-});
-
-// Enhanced streaming chunk schema with tool calls and metadata
-const UnifiedRouterStreamChunkSchema = z.object({
-  choices: z.array(
-    z.object({
-      delta: z.object({ 
-        content: z.string().optional(),
-        tool_calls: z.array(z.object({
-          id: z.string(),
-          type: z.string(),
-          function: z.object({
-            name: z.string(),
-            arguments: z.string()
-          })
-        })).optional(),
-        reasoning: z.string().optional(),
-        logprobs: z.array(z.object({
-          token: z.string(),
-          logprob: z.number(),
-          topLogprobs: z.array(z.object({
-            token: z.string(),
-            logprob: z.number()
-          }))
-        })).optional()
-      }).optional(),
-      finish_reason: z.string().optional().nullable(),
-      index: z.number().optional(),
-    })
-  ),
-  provider_metadata: z.record(z.unknown()).optional()
-});
-
-// Add image generation response schema
-const UnifiedRouterImageGenerationResponseSchema = z.object({
-  id: z.string().optional(),
-  model: z.string().optional(),
-  data: z.array(
-    z.object({
-      url: z.string().optional(),
-      b64_json: z.string().optional(),
-      revised_prompt: z.string().optional()
-    })
-  ),
-  usage: z
-    .object({
-      prompt_tokens: z.number().optional(),
-      completion_tokens: z.number().optional(),
-      total_tokens: z.number().optional(),
-      cost: z.number().optional(),
-    })
-    .optional(),
-  provider_metadata: z.record(z.unknown()).optional()
-});
-
-// Add video generation response schema
-const UnifiedRouterVideoGenerationResponseSchema = z.object({
-  id: z.string().optional(),
-  model: z.string().optional(),
-  data: z.array(
-    z.object({
-      url: z.string().optional(),
-      b64_json: z.string().optional(),
-      revised_prompt: z.string().optional(),
-      duration: z.number().optional(),
-      fps: z.number().optional()
-    })
-  ),
-  usage: z
-    .object({
-      prompt_tokens: z.number().optional(),
-      completion_tokens: z.number().optional(),
-      total_tokens: z.number().optional(),
-      cost: z.number().optional(),
-    })
-    .optional(),
-  provider_metadata: z.record(z.unknown()).optional()
-});
-
-// Extended message type to include additional fields
-interface ExtendedMessage {
-  role: string;
-  content?: string | null;
-  reasoning?: string;
-  logprobs?: Array<{
-    token: string;
-    logprob: number;
-    topLogprobs: Array<{
-      token: string;
-      logprob: number;
-    }>;
-  }>;
-  tool_calls?: Array<{
-    id: string;
-    type: string;
-    function: {
-      name: string;
-      arguments: string;
-    };
-  }>;
-}
-
-// Extended response type to include provider metadata
-interface ExtendedResponse {
+interface UnifiedRouterResponse {
+  id: string;
+  model: string;
+  created: number;
+  object: string;
   choices: Array<{
-    message: ExtendedMessage;
     index: number;
-    finish_reason?: string | null;
+    message?: {
+      role: string;
+      content: string;
+    };
+    delta?: {
+      content?: string;
+      tool_calls?: Array<{
+        id: string;
+        type: string;
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    };
+    finish_reason: string;
   }>;
-  id?: string;
-  model?: string;
-  usage?: {
+  usage: {
     prompt_tokens: number;
     completion_tokens: number;
+    total_tokens: number;
   };
   provider_metadata?: Record<string, unknown>;
 }
 
+interface UnifiedRouterError {
+  error: {
+    message: string;
+    type: string;
+    code: string;
+  };
+}
+
+interface UnifiedRouterImageResponse {
+  data: Array<{
+    b64_json: string;
+    url?: string;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  provider_metadata?: Record<string, unknown>;
+}
+
+interface UnifiedRouterStreamResponse {
+  choices: Array<{
+    delta?: {
+      content?: string;
+      tool_calls?: Array<{
+        id: string;
+        type: string;
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    };
+    finish_reason?: string;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+  };
+  provider_metadata?: LanguageModelV1ProviderMetadata;
+}
+
 export class UnifiedRouterLanguageModel implements LanguageModelV1 {
-  readonly specificationVersion = 'v1';
-  readonly defaultObjectGenerationMode = 'tool';
+  public readonly specificationVersion = 'v1';
+  public readonly modelId: string;
+  public readonly defaultObjectGenerationMode = 'tool';
+  public provider: string;
+  private model: string;
+  private apiKey: string;
+  private baseURL: string;
+  private headers: Record<string, string>;
 
-  readonly modelId: UnifiedRouterModelId;
-  readonly settings: UnifiedRouterSettings;
-  private readonly config: UnifiedRouterProviderConfig;
-
-  constructor(
-    modelId: UnifiedRouterModelId,
-    settings: UnifiedRouterSettings,
-    config: UnifiedRouterProviderConfig,
-  ) {
-    this.modelId = modelId;
-    this.settings = settings;
-    this.config = config;
-  }
-
-  get provider(): string {
-    return this.config.provider;
-  }
-
-  async doGenerate(options: Parameters<LanguageModelV1['doGenerate']>[0]) {
-    const args = {
-      model: this.modelId,
-      ...this.settings.extraBody,
-      ...options,
-    };
-
-    // Handle image generation mode
-    if (options.mode?.type === 'object-json' && this.modelId.includes('dall-e')) {
-      const { responseHeaders, value: response } = await postJsonToApi({
-        url: this.config.url({ path: '/images/generations', modelId: this.modelId }),
-        headers: this.config.headers(),
-        body: args,
-        failedResponseHandler: createJsonErrorResponseHandler({
-          errorSchema: UnifiedRouterErrorSchema,
-          errorToMessage: (err) => {
-            if (typeof err === 'string') return err;
-            const error = err as z.infer<typeof UnifiedRouterErrorSchema>;
-            return error.message || error.error || JSON.stringify(err);
-          },
-        }),
-        successfulResponseHandler: createJsonResponseHandler(
-          UnifiedRouterImageGenerationResponseSchema,
-        ),
-        abortSignal: options.abortSignal,
-        fetch: this.config.fetch,
-      });
-
-      const res = UnifiedRouterImageGenerationResponseSchema.parse(response);
-      const imageData = res.data[0];
-      if (!imageData) throw new Error('No image data in response');
-
-      // Convert base64 to Uint8Array if available
-      let imageDataArray: Uint8Array | undefined;
-      if (imageData.b64_json) {
-        const binaryString = atob(imageData.b64_json);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        imageDataArray = bytes;
-      }
-
-      return {
-        text: undefined,
-        finishReason: 'stop' as LanguageModelV1FinishReason,
-        usage: {
-          promptTokens: res.usage?.prompt_tokens ?? 0,
-          completionTokens: res.usage?.completion_tokens ?? 0,
-        },
-        rawCall: { rawPrompt: options.prompt, rawSettings: args },
-        rawResponse: { headers: responseHeaders },
-        warnings: [],
-        files: imageDataArray ? [{
-          data: imageDataArray,
-          mimeType: 'image/png'
-        }] : undefined,
-        providerMetadata: res.provider_metadata as LanguageModelV1ProviderMetadata,
-      };
-    }
-
-    // Handle video generation mode
-    if (options.mode?.type === 'object-json' && this.modelId.includes('sora')) {
-      const { responseHeaders, value: response } = await postJsonToApi({
-        url: this.config.url({ path: '/videos/generations', modelId: this.modelId }),
-        headers: this.config.headers(),
-        body: args,
-        failedResponseHandler: createJsonErrorResponseHandler({
-          errorSchema: UnifiedRouterErrorSchema,
-          errorToMessage: (err) => {
-            if (typeof err === 'string') return err;
-            const error = err as z.infer<typeof UnifiedRouterErrorSchema>;
-            return error.message || error.error || JSON.stringify(err);
-          },
-        }),
-        successfulResponseHandler: createJsonResponseHandler(
-          UnifiedRouterVideoGenerationResponseSchema,
-        ),
-        abortSignal: options.abortSignal,
-        fetch: this.config.fetch,
-      });
-
-      const res = UnifiedRouterVideoGenerationResponseSchema.parse(response);
-      const videoData = res.data[0];
-      if (!videoData) throw new Error('No video data in response');
-
-      // Convert base64 to Uint8Array if available
-      let videoDataArray: Uint8Array | undefined;
-      if (videoData.b64_json) {
-        const binaryString = atob(videoData.b64_json);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        videoDataArray = bytes;
-      }
-
-      return {
-        text: undefined,
-        finishReason: 'stop' as LanguageModelV1FinishReason,
-        usage: {
-          promptTokens: res.usage?.prompt_tokens ?? 0,
-          completionTokens: res.usage?.completion_tokens ?? 0,
-        },
-        rawCall: { rawPrompt: options.prompt, rawSettings: args },
-        rawResponse: { headers: responseHeaders },
-        warnings: [],
-        files: videoDataArray ? [{
-          data: videoDataArray,
-          mimeType: 'video/mp4'
-        }] : undefined,
-        providerMetadata: res.provider_metadata as LanguageModelV1ProviderMetadata,
-      };
-    }
-
-    // Handle regular chat completion mode
-    const { responseHeaders, value: response } = await postJsonToApi({
-      url: this.config.url({ path: '/chat/completions', modelId: this.modelId }),
-      headers: this.config.headers(),
-      body: args,
-      failedResponseHandler: createJsonErrorResponseHandler({
-        errorSchema: UnifiedRouterErrorSchema,
-        errorToMessage: (err) => {
-          if (typeof err === 'string') return err;
-          const error = err as z.infer<typeof UnifiedRouterErrorSchema>;
-          return error.message || error.error || JSON.stringify(err);
-        },
-      }),
-      successfulResponseHandler: createJsonResponseHandler(
-        UnifiedRouterChatCompletionResponseSchema,
-      ),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch,
-    });
-    const res = UnifiedRouterChatCompletionResponseSchema.parse(response) as ExtendedResponse;
-    const choice = res.choices[0];
-    if (!choice) throw new Error('No choice in response');
-    
-    const message = choice.message;
-    return {
-      text: message.content ?? undefined,
-      finishReason: (choice.finish_reason ?? 'other') as LanguageModelV1FinishReason,
-      usage: {
-        promptTokens: res.usage?.prompt_tokens ?? 0,
-        completionTokens: res.usage?.completion_tokens ?? 0,
-      },
-      rawCall: { rawPrompt: options.prompt, rawSettings: args },
-      rawResponse: { headers: responseHeaders },
-      warnings: [],
-      reasoning: message.reasoning,
-      logprobs: message.logprobs as LanguageModelV1LogProbs,
-      files: undefined,
-      toolCalls: message.tool_calls?.map(tool => ({
-        toolCallType: 'function',
-        toolCallId: tool.id,
-        toolName: tool.function.name,
-        args: tool.function.arguments
-      })) as LanguageModelV1FunctionToolCall[],
-      providerMetadata: res.provider_metadata as LanguageModelV1ProviderMetadata,
+  constructor(config: {
+    provider: string;
+    model: string;
+    apiKey: string;
+    baseURL?: string;
+  }) {
+    this.provider = config.provider;
+    this.model = config.model;
+    this.modelId = config.model;
+    this.apiKey = config.apiKey;
+    this.baseURL = config.baseURL || 'https://api.unifiedrouter.com/v1';
+    this.headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.apiKey}`,
+      'X-Test': 'test-value',
     };
   }
 
-  async doStream(options: LanguageModelV1CallOptions): Promise<{
-    stream: ReadableStream<LanguageModelV1StreamPart>;
-    rawCall: { rawPrompt: unknown; rawSettings: Record<string, unknown> };
-    rawResponse?: { headers?: Record<string, string> };
-    request?: { body?: string };
-    warnings?: import('@ai-sdk/provider').LanguageModelV1CallWarning[];
+  async doGenerate(
+    options: LanguageModelV1CallOptions
+  ): Promise<{
+    text?: string;
+    finishReason: LanguageModelV1FinishReason;
+    usage: {
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+    rawCall: {
+      rawPrompt: unknown;
+      rawSettings: Record<string, unknown>;
+    };
+    rawResponse?: {
+      headers: Record<string, string>;
+    };
+    warnings?: Array<{
+      type: 'other';
+      message: string;
+    }>;
+    providerMetadata?: LanguageModelV1ProviderMetadata;
+    files?: Array<{
+      data: Uint8Array;
+      mimeType: string;
+    }>;
   }> {
-    const args = {
-      model: this.modelId,
-      stream: true,
-      ...this.settings.extraBody,
-      ...options,
-    };
-
-    const headers = this.config.headers();
-    const filteredHeaders: Record<string, string> = {};
-    for (const [key, value] of Object.entries(headers)) {
-      if (value !== undefined) {
-        filteredHeaders[key] = value;
+    // Check if this is an image/video generation request
+    if (options.mode?.type === 'object-json') {
+      const isVideo = this.model.toLowerCase().includes('video');
+      const endpoint = isVideo ? '/videos/generations' : '/images/generations';
+      const prompt = Array.isArray(options.prompt)
+        ? (options.prompt[0]?.content && Array.isArray(options.prompt[0].content) && options.prompt[0].content[0]?.type === 'text'
+            ? options.prompt[0].content[0].text
+            : '')
+        : '';
+      const response = await fetch(`${this.baseURL}${endpoint}`, {
+        method: 'POST',
+        headers: this.headers,
+        body: JSON.stringify({
+          model: this.model,
+          prompt,
+        }),
+      });
+      const data = await response.json() as UnifiedRouterImageResponse;
+      if (!data.data?.[0]) {
+        throw new Error(isVideo ? 'Invalid video generation response' : 'Invalid image generation response');
+      }
+      const fileData = data.data[0];
+      if (fileData.b64_json) {
+        // base64 image/video
+        const buffer = Uint8Array.from(Buffer.from(fileData.b64_json, 'base64'));
+        return {
+          files: [{ data: buffer, mimeType: isVideo ? 'video/mp4' : 'image/png' }],
+          usage: {
+            promptTokens: data.usage?.prompt_tokens ?? 0,
+            completionTokens: data.usage?.completion_tokens ?? 0,
+            totalTokens: data.usage?.total_tokens ?? 0,
+          },
+          finishReason: 'stop',
+          rawCall: {
+            rawPrompt: options.prompt,
+            rawSettings: { model: this.model },
+          },
+          rawResponse: {
+            headers: Object.fromEntries(response.headers.entries()),
+          },
+          warnings: undefined,
+          providerMetadata: typeof data.provider_metadata === 'object' ? data.provider_metadata as LanguageModelV1ProviderMetadata : undefined,
+        };
+      } else {
+        // Only support b64_json for now; if url, throw error or comment for future support
+        throw new Error(isVideo ? 'Invalid video generation response' : 'Invalid image generation response');
       }
     }
 
-    const response = await fetch(this.config.url({ path: '/chat/completions', modelId: this.modelId }), {
+    // Regular text generation
+    const response = await fetch(`${this.baseURL}/chat/completions`, {
       method: 'POST',
-      headers: filteredHeaders,
-      body: JSON.stringify(args),
-      signal: options.abortSignal,
+      headers: this.headers,
+      body: JSON.stringify({
+        model: this.model,
+        messages: Array.isArray(options.prompt)
+          ? (options.prompt as LanguageModelV1Message[]).map(msg => ({
+              role: msg.role,
+              content: (msg.content as LanguageModelV1TextPart[]).map(part => part.text).join('')
+            }))
+          : [{ role: 'user', content: options.prompt }],
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
+        stream: false,
+      }),
+    });
+
+    const data = await response.json() as UnifiedRouterResponse | UnifiedRouterError;
+
+    if ('error' in data) {
+      throw new Error(`Unified Router API error: ${data.error?.message || 'Unknown error'}`);
+    }
+
+    const choice = data.choices[0];
+    return {
+      text: choice.message?.content,
+      finishReason: choice.finish_reason as LanguageModelV1FinishReason,
+      usage: {
+        promptTokens: data.usage.prompt_tokens,
+        completionTokens: data.usage.completion_tokens,
+        totalTokens: data.usage.total_tokens,
+      },
+      rawCall: {
+        rawPrompt: options.prompt,
+        rawSettings: { model: this.model },
+      },
+      rawResponse: {
+        headers: Object.fromEntries(response.headers.entries()),
+      },
+      warnings: [],
+      providerMetadata: data.provider_metadata as LanguageModelV1ProviderMetadata,
+    };
+  }
+
+  async doStream(
+    options: LanguageModelV1CallOptions
+  ): Promise<{
+    stream: ReadableStream<LanguageModelV1StreamPart>;
+    rawCall: {
+      rawPrompt: unknown;
+      rawSettings: Record<string, unknown>;
+    };
+    rawResponse?: {
+      headers: Record<string, string>;
+    };
+    request?: {
+      body: string;
+    };
+    warnings?: Array<{
+      type: 'other';
+      message: string;
+    }>;
+  }> {
+    const response = await fetch(`${this.baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify({
+        model: this.model,
+        messages: Array.isArray(options.prompt)
+          ? (options.prompt as LanguageModelV1Message[]).map(msg => ({
+              role: msg.role,
+              content: (msg.content as LanguageModelV1TextPart[]).map(part => part.text).join('')
+            }))
+          : [{ role: 'user', content: options.prompt }],
+        temperature: options.temperature,
+        max_tokens: options.maxTokens,
+        stream: true,
+      }),
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      const parsedError = UnifiedRouterErrorSchema.parse(error);
-      throw new Error(parsedError.message || parsedError.error || JSON.stringify(error));
+      const errorData = await response.json() as UnifiedRouterError;
+      throw new Error(`Unified Router API error: ${errorData.error?.message || 'Unknown error'}`);
     }
 
     if (!response.body) {
-      throw new Error('No response body');
+      throw new Error('Response body is null');
     }
 
-    const transformStream = new TransformStream({
-      transform: async (chunk: Uint8Array, controller) => {
-        const text = new TextDecoder().decode(chunk);
-        const lines = text.split('\n').filter(line => line.trim() !== '');
-        
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    const stream = new ReadableStream<LanguageModelV1StreamPart>({
+      async pull(controller): Promise<void> {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          controller.close();
+          return;
+        }
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n').filter(Boolean);
+
         for (const line of lines) {
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
-            if (data === '[DONE]') continue;
-            
             try {
-              const parsedChunk = UnifiedRouterStreamChunkSchema.parse(JSON.parse(data));
-              for (const choice of parsedChunk.choices) {
-                if (choice.delta?.content) {
-                  controller.enqueue({ type: 'text-delta', textDelta: choice.delta.content });
+              const parsed = JSON.parse(data) as UnifiedRouterStreamResponse;
+              if (parsed.choices?.[0]?.delta?.content) {
+                controller.enqueue({
+                  type: 'text-delta',
+                  textDelta: parsed.choices[0].delta.content,
+                });
+              } else if (parsed.choices?.[0]?.delta?.tool_calls?.[0]) {
+                const toolCall = parsed.choices[0].delta.tool_calls[0];
+                controller.enqueue({
+                  type: 'tool-call-delta',
+                  toolCallType: 'function' as const,
+                  toolCallId: toolCall.id,
+                  toolName: toolCall.function.name,
+                  argsTextDelta: toolCall.function.arguments,
+                });
+              } else if (parsed.choices?.[0]?.finish_reason) {
+                const finishChunk: {
+                  type: 'finish';
+                  finishReason: LanguageModelV1FinishReason;
+                  usage: {
+                    promptTokens: number;
+                    completionTokens: number;
+                  };
+                  providerMetadata?: LanguageModelV1ProviderMetadata;
+                } = {
+                  type: 'finish',
+                  finishReason: parsed.choices[0].finish_reason as LanguageModelV1FinishReason,
+                  usage: {
+                    promptTokens: parsed.usage?.prompt_tokens ?? 0,
+                    completionTokens: parsed.usage?.completion_tokens ?? 0,
+                  },
+                };
+
+                if (parsed.provider_metadata) {
+                  finishChunk.providerMetadata = parsed.provider_metadata;
                 }
-                if (choice.delta?.tool_calls) {
-                  for (const tool of choice.delta.tool_calls) {
-                    controller.enqueue({ 
-                      type: 'tool-call-delta',
-                      toolCallType: 'function',
-                      toolCallId: tool.id,
-                      toolName: tool.function.name,
-                      argsTextDelta: tool.function.arguments
-                    });
-                  }
-                }
-                if (choice.delta?.reasoning) {
-                  controller.enqueue({ type: 'reasoning', textDelta: choice.delta.reasoning });
-                }
-                if (choice.delta?.logprobs) {
-                  controller.enqueue({ 
-                    type: 'response-metadata',
-                    modelId: this.modelId,
-                    timestamp: new Date()
-                  });
-                }
-                if (choice.finish_reason) {
-                  controller.enqueue({
-                    type: 'finish',
-                    finishReason: (choice.finish_reason ?? 'other') as LanguageModelV1FinishReason,
-                    usage: { promptTokens: 0, completionTokens: 0 },
-                    providerMetadata: parsedChunk.provider_metadata as LanguageModelV1ProviderMetadata
-                  });
-                }
+
+                controller.enqueue(finishChunk);
               }
-            } catch (error) {
-              console.error('Error parsing chunk:', error);
-            }
+            } catch (e) { /* ignore */ }
           }
         }
-      }
+      },
     });
 
     return {
-      stream: response.body.pipeThrough(transformStream) as ReadableStream<LanguageModelV1StreamPart>,
-      rawCall: { rawPrompt: options.prompt, rawSettings: args },
-      rawResponse: { headers: Object.fromEntries(response.headers.entries()) },
-      request: { body: JSON.stringify(args) },
-      warnings: [],
+      stream,
+      rawCall: {
+        rawPrompt: options.prompt,
+        rawSettings: { model: this.model },
+      },
+      rawResponse: {
+        headers: Object.fromEntries(response.headers.entries()),
+      },
     };
   }
 } 

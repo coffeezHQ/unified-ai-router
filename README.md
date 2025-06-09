@@ -5,7 +5,7 @@
 [![npm version](https://badge.fury.io/js/unified-ai-router.svg)](https://badge.fury.io/js/unified-ai-router)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A unified provider package for the Vercel AI SDK, supporting seamless integration with multiple LLM APIs through a single, pluggable interface. This package mimics the API of [`@openrouter/ai-sdk-provider`](https://github.com/OpenRouterTeam/ai-sdk-provider) and is designed for use with the [`ai`](https://sdk.vercel.ai/docs) SDK.
+A unified provider package for the Vercel AI SDK, supporting seamless integration with multiple LLM APIs through a single, pluggable interface. This package is designed for use with the [`ai`](https://sdk.vercel.ai/docs) SDK.
 
 ## Features
 - Unified interface for LLM providers (OpenAI, Anthropic, Cohere, Gemini, etc.)
