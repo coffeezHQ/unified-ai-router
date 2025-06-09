@@ -1,20 +1,21 @@
+import { LanguageModelV1 } from '@ai-sdk/provider';
 import { UnifiedRouterLanguageModel } from './unified-router-language-model';
-import type { UnifiedRouterModelId, UnifiedRouterSettings, UnifiedRouterProviderConfig } from './types/unified-router-provider';
 
-export function createUnifiedRouter(settings: UnifiedRouterSettings) {
-  return (modelId: UnifiedRouterModelId) => {
-    const config: UnifiedRouterProviderConfig = {
+export interface UnifiedRouterProviderConfig {
+  apiKey: string;
+  baseURL?: string;
+  extraBody?: Record<string, unknown>;
+}
+
+export function createUnifiedRouter(config: UnifiedRouterProviderConfig) {
+  return (model: string, modelOptions?: { extraBody?: Record<string, unknown> }) => {
+    return new UnifiedRouterLanguageModel({
+      model,
+      apiKey: config.apiKey,
+      baseURL: config.baseURL,
+      extraBody: { ...config.extraBody, ...modelOptions?.extraBody },
       provider: 'unified-ai-router',
-      compatibility: 'compatible',
-      headers: () => ({
-        'Authorization': `Bearer ${settings.apiKey}`,
-        'Content-Type': 'application/json',
-        ...(settings.headers || {}),
-      }),
-      url: ({ modelId, path }) => settings.baseURL ? `${settings.baseURL}${path}` : `https://api.unifiedrouter.ai/v1${path}`,
-      extraBody: settings.extraBody,
-    };
-    return new UnifiedRouterLanguageModel(modelId, settings, config);
+    });
   };
 }
 
