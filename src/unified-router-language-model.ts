@@ -53,6 +53,28 @@ interface UnifiedRouterImageResponse {
   provider_metadata?: Record<string, unknown>;
 }
 
+interface UnifiedRouterStreamResponse {
+  choices: Array<{
+    delta?: {
+      content?: string;
+      tool_calls?: Array<{
+        id: string;
+        type: string;
+        function: {
+          name: string;
+          arguments: string;
+        };
+      }>;
+    };
+    finish_reason?: string;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+  };
+  provider_metadata?: LanguageModelV1ProviderMetadata;
+}
+
 export class UnifiedRouterLanguageModel implements LanguageModelV1 {
   public readonly specificationVersion = 'v1';
   public readonly modelId: string;
@@ -266,13 +288,13 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
           if (line.startsWith('data: ')) {
             const data = line.slice(6);
             try {
-              const parsed = JSON.parse(data);
+              const parsed = JSON.parse(data) as UnifiedRouterStreamResponse;
               if (parsed.choices?.[0]?.delta?.content) {
                 controller.enqueue({
                   type: 'text-delta',
                   textDelta: parsed.choices[0].delta.content,
                 });
-              } else if (parsed.choices?.[0]?.delta?.tool_calls) {
+              } else if (parsed.choices?.[0]?.delta?.tool_calls?.[0]) {
                 const toolCall = parsed.choices[0].delta.tool_calls[0];
                 controller.enqueue({
                   type: 'tool-call-delta',
@@ -282,19 +304,27 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
                   argsTextDelta: toolCall.function.arguments,
                 });
               } else if (parsed.choices?.[0]?.finish_reason) {
-                const finishChunk: any = {
+                const finishChunk: {
+                  type: 'finish';
+                  finishReason: LanguageModelV1FinishReason;
+                  usage: {
+                    promptTokens: number;
+                    completionTokens: number;
+                  };
+                  providerMetadata?: LanguageModelV1ProviderMetadata;
+                } = {
                   type: 'finish',
                   finishReason: parsed.choices[0].finish_reason as LanguageModelV1FinishReason,
-                };
-                if (parsed.usage) {
-                  finishChunk.usage = {
+                  usage: {
                     promptTokens: parsed.usage?.prompt_tokens ?? 0,
                     completionTokens: parsed.usage?.completion_tokens ?? 0,
-                  };
+                  },
+                };
+
+                if (parsed.provider_metadata) {
+                  finishChunk.providerMetadata = parsed.provider_metadata;
                 }
-                if (typeof parsed.provider_metadata === 'object') {
-                  finishChunk.providerMetadata = parsed.provider_metadata as LanguageModelV1ProviderMetadata;
-                }
+
                 controller.enqueue(finishChunk);
               }
             } catch (e) { /* ignore */ }
