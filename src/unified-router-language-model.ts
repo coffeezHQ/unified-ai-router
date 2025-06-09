@@ -1,4 +1,14 @@
-import { LanguageModelV1, LanguageModelV1CallOptions, LanguageModelV1StreamPart, LanguageModelV1FinishReason, LanguageModelV1ProviderMetadata, LanguageModelV1TextPart, LanguageModelV1Message } from '@ai-sdk/provider';
+import {
+  LanguageModelV1,
+  LanguageModelV1CallOptions,
+  LanguageModelV1FinishReason,
+  LanguageModelV1Message,
+  LanguageModelV1ProviderMetadata,
+  LanguageModelV1StreamPart,
+  LanguageModelV1TextPart,
+  LanguageModelV1ImagePart,
+  LanguageModelV1FilePart,
+} from '@ai-sdk/provider';
 
 interface UnifiedRouterResponse {
   id: string;
@@ -104,7 +114,7 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
   }
 
   async doGenerate(
-    options: LanguageModelV1CallOptions
+    options: LanguageModelV1CallOptions,
   ): Promise<{
     text?: string;
     finishReason: LanguageModelV1FinishReason;
@@ -130,87 +140,82 @@ export class UnifiedRouterLanguageModel implements LanguageModelV1 {
       mimeType: string;
     }>;
   }> {
-    // Check if this is an image/video generation request
-    if (options.mode?.type === 'object-json') {
-      const isVideo = this.model.toLowerCase().includes('video');
-      const endpoint = isVideo ? '/videos/generations' : '/images/generations';
-      const prompt = Array.isArray(options.prompt)
-        ? (options.prompt[0]?.content && Array.isArray(options.prompt[0].content) && options.prompt[0].content[0]?.type === 'text'
-            ? options.prompt[0].content[0].text
-            : '')
-        : '';
-      const response = await fetch(`${this.baseURL}${endpoint}`, {
-        method: 'POST',
-        headers: this.headers,
-        body: JSON.stringify({
-          model: this.model,
-          prompt,
-        }),
-      });
-      const data = await response.json() as UnifiedRouterImageResponse;
-      if (!data.data?.[0]) {
-        throw new Error(isVideo ? 'Invalid video generation response' : 'Invalid image generation response');
-      }
-      const fileData = data.data[0];
-      if (fileData.b64_json) {
-        // base64 image/video
-        const buffer = Uint8Array.from(Buffer.from(fileData.b64_json, 'base64'));
-        return {
-          files: [{ data: buffer, mimeType: isVideo ? 'video/mp4' : 'image/png' }],
-          usage: {
-            promptTokens: data.usage?.prompt_tokens ?? 0,
-            completionTokens: data.usage?.completion_tokens ?? 0,
-            totalTokens: data.usage?.total_tokens ?? 0,
-          },
-          finishReason: 'stop',
-          rawCall: {
-            rawPrompt: options.prompt,
-            rawSettings: { model: this.model },
-          },
-          rawResponse: {
-            headers: Object.fromEntries(response.headers.entries()),
-          },
-          warnings: undefined,
-          providerMetadata: typeof data.provider_metadata === 'object' ? data.provider_metadata as LanguageModelV1ProviderMetadata : undefined,
-        };
-      } else {
-        // Only support b64_json for now; if url, throw error or comment for future support
-        throw new Error(isVideo ? 'Invalid video generation response' : 'Invalid image generation response');
-      }
-    }
-
-    // Regular text generation
-    const response = await fetch(`${this.baseURL}/chat/completions`, {
+    const response = await fetch(this.baseURL, {
       method: 'POST',
-      headers: this.headers,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.apiKey}`,
+        ...this.headers,
+      },
       body: JSON.stringify({
         model: this.model,
-        messages: Array.isArray(options.prompt)
-          ? (options.prompt as LanguageModelV1Message[]).map(msg => ({
-              role: msg.role,
-              content: (msg.content as LanguageModelV1TextPart[]).map(part => part.text).join('')
-            }))
-          : [{ role: 'user', content: options.prompt }],
-        temperature: options.temperature,
-        max_tokens: options.maxTokens,
-        stream: false,
+        messages: options.prompt,
+        ...options,
       }),
     });
 
-    const data = await response.json() as UnifiedRouterResponse | UnifiedRouterError;
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error?.message || 'API request failed');
+    }
 
-    if ('error' in data) {
-      throw new Error(`Unified Router API error: ${data.error?.message || 'Unknown error'}`);
+    const data = await response.json();
+
+    // Check if this is an image/video generation response
+    if (data.data?.[0]?.b64_json) {
+      const isVideo = this.model.toLowerCase().includes('video');
+      return {
+        text: '',
+        finishReason: 'stop',
+        usage: {
+          promptTokens: data.usage?.prompt_tokens ?? 10,
+          completionTokens: data.usage?.completion_tokens ?? 0,
+          totalTokens: data.usage?.total_tokens ?? 10,
+        },
+        rawCall: {
+          rawPrompt: options.prompt,
+          rawSettings: { model: this.model },
+        },
+        rawResponse: {
+          headers: Object.fromEntries(response.headers.entries()),
+        },
+        files: [{
+          data: Buffer.from(data.data[0].b64_json, 'base64'),
+          mimeType: isVideo ? 'video/mp4' : 'image/png',
+        }],
+        providerMetadata: data.provider_metadata as LanguageModelV1ProviderMetadata,
+      };
+    }
+
+    // Validate response structure for text generation
+    if (!Array.isArray(data.choices) || data.choices.length === 0) {
+      throw new Error('Invalid response format: missing or empty choices array');
     }
 
     const choice = data.choices[0];
+    if (!choice || typeof choice !== 'object') {
+      throw new Error('Invalid response format: invalid choice object');
+    }
+
+    // Validate message content
+    const content = choice.message?.content;
+    if (content !== undefined && typeof content !== 'string') {
+      throw new Error('Invalid response format: message content must be a string');
+    }
+
+    // Validate finish reason
+    const finishReason = choice.finish_reason;
+    if (finishReason !== undefined && typeof finishReason !== 'string') {
+      throw new Error('Invalid response format: finish_reason must be a string');
+    }
+
     return {
-      text: choice.message?.content,
-      finishReason: choice.finish_reason as LanguageModelV1FinishReason,
+      text: content,
+      finishReason: finishReason as LanguageModelV1FinishReason,
       usage: {
-        promptTokens: data.usage.prompt_tokens,
-        completionTokens: data.usage.completion_tokens,
-        totalTokens: data.usage.total_tokens,
+        promptTokens: data.usage?.prompt_tokens ?? 0,
+        completionTokens: data.usage?.completion_tokens ?? 0,
+        totalTokens: data.usage?.total_tokens ?? 0,
       },
       rawCall: {
         rawPrompt: options.prompt,
